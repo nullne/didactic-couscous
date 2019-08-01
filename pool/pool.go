@@ -24,6 +24,7 @@ type Pool struct {
 	prefillSize float64
 	poolSize    float64
 	getSize     int64
+	notShuffle  bool
 
 	pools    [2]pool
 	recorder Recorder
@@ -37,11 +38,12 @@ func New(ctx context.Context, recorder Recorder, opt Options) *Pool {
 	rand.Seed(int64(time.Now().Nanosecond()))
 	dataCh := make(chan []byte)
 	p := Pool{
-		poolSize: opt.GetQPS * opt.GetPeriod.Seconds(),
-		get:      make(chan []byte),
-		put:      dataCh,
-		getSize:  int64(1 / opt.SampleRatio),
-		recorder: recorder,
+		poolSize:   opt.GetQPS * opt.GetPeriod.Seconds(),
+		get:        make(chan []byte),
+		put:        dataCh,
+		getSize:    int64(1 / opt.SampleRatio),
+		recorder:   recorder,
+		notShuffle: opt.NotShuffle,
 	}
 
 	if opt.PutQPS > opt.GetQPS {
@@ -99,6 +101,8 @@ type Options struct {
 
 	ReadOnly bool
 	ReadOnce bool
+
+	NotShuffle bool
 }
 
 func (opt *Options) setDefault() {
@@ -324,7 +328,9 @@ func (p *Pool) fillPool(ctx context.Context, data [][]byte, qps, burst float64) 
 			return err
 		}
 	}
-
+	if p.notShuffle {
+		return nil
+	}
 	//shuffle the data
 	dest := make([][]byte, len(data))
 	perm := rand.Perm(len(data))
