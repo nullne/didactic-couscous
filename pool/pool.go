@@ -18,6 +18,7 @@ import (
 
 var (
 	ErrReadOnce = errors.New("the pool should only be read once")
+	ErrDone     = errors.New("the pool is closed/finished")
 )
 
 type Options struct {
@@ -38,6 +39,9 @@ type Options struct {
 }
 
 func (opt Options) prefillSize() float64 {
+	if opt.ReadOnly {
+		return opt.poolSize() / opt.SampleRatio
+	}
 	if opt.PutQPS >= opt.GetQPS {
 		return opt.poolSize() / opt.SampleRatio
 	} else {
@@ -94,6 +98,8 @@ type Pool struct {
 
 	logCh chan string
 
+	closePut chan struct{}
+
 	poolSize float64
 	getSize  int64
 	options  Options
@@ -114,6 +120,7 @@ func New(ctx context.Context, recorder Recorder, opt Options) *Pool {
 		recorder: recorder,
 		options:  opt,
 		logCh:    make(chan string, 1000),
+		closePut: make(chan struct{}),
 	}
 
 	p.pools[0] = newPool(int(p.poolSize))
@@ -124,12 +131,16 @@ func New(ctx context.Context, recorder Recorder, opt Options) *Pool {
 
 	go func() {
 		if err := p.prefill(ctx, prefillSize); err != nil {
-			p.debug("failed to prefill: ", err)
+			p.debug("failed to prefill: %v", err)
+			close(p.get)
+			close(p.closePut)
 			return
 		}
 		go p.fillPools(ctx, opt.MaxGetQPS, opt.Burst)
 		go p.getWorker(ctx, opt.GetQPS, opt.Burst)
-		if !opt.ReadOnly {
+		if opt.ReadOnly {
+			close(p.closePut)
+		} else {
 			go p.putWorker(ctx, opt.PutQPS, opt.Burst)
 		}
 	}()
@@ -142,6 +153,8 @@ func (p *Pool) Put(ctx context.Context, data []byte) error {
 		return ctx.Err()
 	case p.put <- data:
 		return nil
+	case <-p.closePut:
+		return ErrDone
 	}
 }
 
@@ -149,7 +162,10 @@ func (p *Pool) Get(ctx context.Context) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case data := <-p.get:
+	case data, ok := <-p.get:
+		if !ok {
+			return nil, ErrDone
+		}
 		return data, nil
 	}
 }
@@ -163,8 +179,16 @@ func (p *Pool) debug(format string, a ...interface{}) {
 }
 
 // return debug message channel from which debug message can be read
-func (p *Pool) DebugCh(ctx context.Context) chan string {
+func (p *Pool) DebugCh() chan string {
 	return p.logCh
+}
+
+func (p *Pool) Summary() string {
+	return fmt.Sprintf("get %d, put %d, prefill %d",
+		atomic.LoadUint64(&(p.counter.get)),
+		atomic.LoadUint64(&(p.counter.put)),
+		atomic.LoadUint64(&(p.counter.prefill)),
+	)
 }
 
 type pool struct {
@@ -183,36 +207,8 @@ func newPool(size int) pool {
 }
 
 func (p *Pool) prefill(ctx context.Context, prefillSize float64) error {
-	p.debug("start prefill", prefillSize)
+	p.debug("start prefill %v", prefillSize)
 	defer p.debug("finish prefill")
-	// var counter uint64
-	// finish := make(chan error, 1)
-	// go func() (err error) {
-	// 	defer log.Println("finish real prefill")
-	// 	defer func() {
-	// 		finish <- err
-	// 	}()
-	// 	wlimiter := rate.NewLimiter(rate.Every(time.Second/time.Duration(wqps)), int(burst))
-	// 	for {
-	// 		select {
-	// 		case <-ctx.Done():
-	// 			return ctx.Err()
-	// 		case key, ok := <-ch:
-	// 			if !ok {
-	// 				return errors.New("channel was closed")
-	// 			}
-	// 			if err := p.recorder.Put(key); err != nil {
-	// 				return err
-	// 			}
-	// 			if c := atomic.AddUint64(&counter, 1); float64(c) >= p.prefillSize {
-	// 				return nil
-	// 			}
-	// 		}
-	// 		if err := wlimiter.Wait(ctx); err != nil {
-	// 			return err
-	// 		}
-	// 	}
-	// }()
 
 	// step 1: read from existed
 	need, rcounter, err := p.needPrefill(ctx, prefillSize)
@@ -246,7 +242,7 @@ func (p *Pool) prefill(ctx context.Context, prefillSize float64) error {
 
 func (p *Pool) needPrefill(ctx context.Context, prefillSize float64) (bool, uint64, error) {
 	defer p.recorder.Rewind()
-	batchSize := float64(100)
+	batchSize := float64(1)
 	if batchSize > prefillSize {
 		batchSize = prefillSize
 	}
@@ -272,7 +268,7 @@ func (p *Pool) needPrefill(ctx context.Context, prefillSize float64) (bool, uint
 			return false, 0, nil
 		}
 		// read to EOF
-		if len(bs) < int(n) {
+		if len(bs) < int(batchSize) {
 			p.debug("read %v from the existed", rcounter)
 			break
 		}
@@ -287,14 +283,11 @@ func (p *Pool) putWorker(ctx context.Context, putQPS, burst float64) {
 		select {
 		case <-ctx.Done():
 			return
-		case data, ok := <-p.dataCh:
-			if !ok {
-				p.debug("finish put worker")
-				return
-			}
+		case data := <-p.put:
 			if err := p.recorder.Put(data); err != nil {
 				p.debug("failed to out into recorder: %v", err)
 				time.Sleep(time.Second)
+				continue
 			}
 			atomic.AddUint64(&(p.counter.put), 1)
 		}
@@ -302,6 +295,7 @@ func (p *Pool) putWorker(ctx context.Context, putQPS, burst float64) {
 }
 
 func (p *Pool) getWorker(ctx context.Context, getQPS, burst float64) {
+	defer close(p.get)
 	limiter := rate.NewLimiter(rate.Every(time.Second/time.Duration(getQPS)), int(burst))
 	idx := 0
 Outer:
@@ -338,23 +332,16 @@ Outer:
 		return
 	}
 	p.debug("read remainings")
-	for {
+	for _, key := range p.remainings {
+		if err := limiter.Wait(ctx); err != nil {
+			p.debug("limiter 2 error: %v", err)
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
-		for _, key := range p.remainings {
-			if err := limiter.Wait(ctx); err != nil {
-				p.debug("limiter error: %v", err)
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case p.get <- key:
-				atomic.AddUint64(&(p.counter.get), 1)
-			}
+		case p.get <- key:
+			atomic.AddUint64(&(p.counter.get), 1)
 		}
 	}
 }
@@ -380,35 +367,10 @@ func (p *Pool) fillPools(ctx context.Context, qps, burst float64) {
 			p.pools[idx].writable <- struct{}{}
 			continue
 		}
-		// if err := p.dump(idx); err != nil {
-		// 	time.Sleep(time.Second)
-		// 	p.pools[idx].writable <- struct{}{}
-		// 	continue
-		// }
 		p.pools[idx].readable <- struct{}{}
 		idx = (idx + 1) % 2
 	}
 }
-
-// func (p *Pool) dump(idx int) error {
-// 	dir, err := ioutil.TempDir("/tmp", "oss-key")
-// 	if err != nil {
-// 		return err
-// 	}
-// 	fp := path.Join(dir, "key-file")
-// 	f, err := os.Create(fp)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer f.Close()
-// 	log.Println("dump key file to ", fp, idx)
-// 	for _, key := range p.pools[idx].data {
-// 		if _, err := f.Write(append(key, '\n')); err != nil {
-// 			return err
-// 		}
-// 	}
-// 	return nil
-// }
 
 func (p *Pool) fillPool(ctx context.Context, data [][]byte, qps, burst float64) error {
 	limiter := rate.NewLimiter(rate.Every(time.Second/time.Duration(qps)), int(burst))
@@ -419,7 +381,7 @@ func (p *Pool) fillPool(ctx context.Context, data [][]byte, qps, burst float64) 
 		}
 		if int64(len(bs)) != p.getSize {
 			// need rewind and get more
-			if p.opt.ReadOnce {
+			if p.options.ReadOnce {
 				p.remainings = data[:i]
 				if err := shuffle(p.remainings); err != nil {
 					p.debug("failed to shuffle: %v", err)
@@ -454,7 +416,7 @@ func shuffle(data [][]byte) error {
 	for i, v := range perm {
 		dest[v] = data[i]
 	}
-	if n := copy(data, dest); float64(n) != len(data) {
+	if n := copy(data, dest); n != len(data) {
 		return fmt.Errorf("failed to copy, got %v, want %v", n, len(data))
 	}
 	return nil
